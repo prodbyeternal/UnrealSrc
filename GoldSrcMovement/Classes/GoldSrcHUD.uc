@@ -178,10 +178,8 @@ var config bool bRevengeMarker;
 var config bool bMultikillPips;
 var config bool bDeathRecap;
 var config bool bPickupTimers;
-var config bool bDesaturate;
 var config bool bModernScoreboard; // replaces the stock board while Tab is held
 var config bool bMVPCard;
-var config bool bSpectatorHUD;
 
 var config color FeedColor;       // other players' kills
 var config color MyFeedColor;     // kills we were part of
@@ -189,7 +187,6 @@ var config color FeedSelfColor;   // our own death
 var config color ArrowColor;
 var config color HPBarColor;
 var config color ShieldBarColor;
-var config color VignetteColor;
 
 const KILLFEED_MAX  = 6;
 const KILLFEED_TIME = 6.0;
@@ -203,7 +200,6 @@ const HPBAR_H       = 5.0;
 const HPBAR_MAX     = 4;
 const PICKUP_MAX    = 24;
 const PICKUP_SCAN   = 0.5;       // seconds between pickup hidden/visible polls
-const VIGNETTE_HP   = 25;        // desaturation starts under this health
 
 struct KillFeedEntry
 {
@@ -307,6 +303,20 @@ simulated function NoteEnemyHit(Pawn Victim, vector HitLocation, int Damage,
 	DmgNums[Oldest].DriftX    = ((HitLocation.X + HitLocation.Y) % 7 - 3) * (DMGNUM_DRIFT / 3.0);
 }
 
+// True if a world point is actually in front of the camera. WorldToScreen
+// alone is not enough on this build: points behind the camera come back
+// mirrored with a positive Z, so a naive Z check lets them draw -- that was
+// the "revenge marker / pickup timer visible when I look away" bug.
+simulated final function bool IsInFront(canvas Canvas, vector WorldLoc)
+{
+	local vector  CamLoc, CamDir;
+	local rotator CamRot;
+
+	Canvas.GetCameraLocation(CamLoc, CamRot);
+	CamDir = vector(CamRot);
+	return (WorldLoc - CamLoc) dot CamDir > 0.0;
+}
+
 simulated final function DrawHitmarker(canvas Canvas)
 {
 	local float CX, CY, Scale, Alpha, Age, Grow, Dist, StepAlpha, Thick;
@@ -394,7 +404,7 @@ simulated final function DrawDamageNumbers(canvas Canvas)
 		}
 
 		Screen = Canvas.WorldToScreen(DmgNums[i].WorldLoc);
-		if (Screen.Z <= 0.0)
+		if (Screen.Z <= 0.0 || !IsInFront(Canvas, DmgNums[i].WorldLoc))
 			continue;   // behind us
 
 		Fade = 1.0 - Age / DMGNUM_TIME;
@@ -856,9 +866,6 @@ simulated final function DrawGoldSrcOverlay(canvas Canvas)
 	if (bHitmarker)
 		DrawHitmarker(Canvas);
 
-	// whole screen, everything else rides on top of it.
-	DrawDesat(Canvas);
-
 	if (bArrowRing && GP.bDamageIndicator)
 		DrawArrowRing(Canvas);
 
@@ -877,9 +884,7 @@ simulated final function DrawGoldSrcOverlay(canvas Canvas)
 	if (bPickupTimers)
 		DrawPickupTimers(Canvas);
 
-	DrawKillcamLabel(Canvas, GP);
 	DrawDeathRecap(Canvas, GP);
-	DrawSpectatorHUD(Canvas);
 	DrawRJPopup(Canvas, GP);
 
 	M = GP.Move;
@@ -2323,7 +2328,7 @@ simulated final function DrawEnemyHPBar(canvas Canvas)
 		Head.Z += HPTracks[i].Victim.CollisionHeight + 12;
 
 		Screen = Canvas.WorldToScreen(Head);
-		if (Screen.Z <= 0.0)
+		if (Screen.Z <= 0.0 || !IsInFront(Canvas, Head))
 			continue;
 
 		Fade  = 1.0 - Age / HPBAR_TIME;
@@ -2371,7 +2376,7 @@ simulated final function DrawRevengeMarker(canvas Canvas, GoldSrcPlayer GP)
 	Head.Z += GP.RevengeTarget.CollisionHeight + 30;
 
 	Screen = Canvas.WorldToScreen(Head);
-	if (Screen.Z <= 0.0)
+	if (Screen.Z <= 0.0 || !IsInFront(Canvas, Head))
 		return;
 
 	// Pulse so it reads as a marker and not a floating decoration.
@@ -2411,44 +2416,6 @@ simulated final function DrawMultikillPips(canvas Canvas, GoldSrcPlayer GP)
 		Canvas.SetPos(CX - (N * 9 * Scale) * 0.5 + i * 9 * Scale, CY);
 		Canvas.DrawRect(Texture'Engine.WhiteSquareTexture', 6 * Scale, 6 * Scale);
 	}
-}
-
-// --- low-HP desaturation ---------------------------------------------------------
-// A cool gray tint plus darkened screen edges. There is no shader access from
-// canvas, so "desaturation" is a translucent blue-gray wash whose opacity
-// scales with how close to dead we are -- it reads as the same thing in motion.
-
-simulated final function DrawDesat(canvas Canvas)
-{
-	local float Frac, Alpha;
-	local Pawn  P;
-
-	if (!bDesaturate || PlayerOwner == None)
-		return;
-
-	P = PlayerOwner.Pawn;
-	if (P == None || P.Health > VIGNETTE_HP)
-		return;
-
-	Frac  = 1.0 - float(P.Health) / float(VIGNETTE_HP);
-	Alpha = int(120 * Frac);
-
-	// full-screen wash
-	Canvas.SetDrawColor(90, 100, 120, Alpha);
-	Canvas.SetPos(0, 0);
-	Canvas.DrawRect(Texture'Engine.WhiteSquareTexture', Canvas.ClipX, Canvas.ClipY);
-
-	// pulsing edge darkening: four border strips, thicker = closer to death
-	Alpha = int(90 * Frac * (0.7 + 0.3 * Sin(Level.TimeSeconds * 5.0)));
-	Canvas.SetDrawColor(0, 0, 0, Alpha);
-	Canvas.SetPos(0, 0);
-	Canvas.DrawRect(Texture'Engine.WhiteSquareTexture', Canvas.ClipX, 30);
-	Canvas.SetPos(0, Canvas.ClipY - 30);
-	Canvas.DrawRect(Texture'Engine.WhiteSquareTexture', Canvas.ClipX, 30);
-	Canvas.SetPos(0, 0);
-	Canvas.DrawRect(Texture'Engine.WhiteSquareTexture', 30, Canvas.ClipY);
-	Canvas.SetPos(Canvas.ClipX - 30, 0);
-	Canvas.DrawRect(Texture'Engine.WhiteSquareTexture', 30, Canvas.ClipY);
 }
 
 // --- weapon pickup respawn timers --------------------------------------------------
@@ -2514,7 +2481,7 @@ simulated final function DrawPickupTimers(canvas Canvas)
 		}
 
 		Screen = Canvas.WorldToScreen(PickupList[i].Pickup.Location);
-		if (Screen.Z <= 0.0)
+		if (Screen.Z <= 0.0 || !IsInFront(Canvas, PickupList[i].Pickup.Location))
 			continue;
 
 		S = PickupList[i].Label $ "  " $ string(int(Left + 0.999));
@@ -2566,25 +2533,6 @@ simulated final function DrawRJPopup(canvas Canvas, GoldSrcPlayer GP)
 	Canvas.TextSize(S, XL, YL);
 	Canvas.SetDrawColor(255, 210, 120, int(255 * Alpha));
 	Canvas.SetPos(Canvas.ClipX * 0.5 - XL * 0.5, Canvas.ClipY * 0.5 + 70 * FMax(Canvas.ClipY / 600.0, 0.5));
-	Canvas.DrawText(S);
-}
-
-// --- killcam label ------------------------------------------------------------------
-
-simulated final function DrawKillcamLabel(canvas Canvas, GoldSrcPlayer GP)
-{
-	local float Alpha, XL, YL;
-	local string S;
-
-	if (!GP.bKillcamActive || GP.KillcamEnd <= 0.0 || Level.TimeSeconds > GP.KillcamEnd)
-		return;
-
-	Alpha = FMin(1.0, GP.KillcamEnd - Level.TimeSeconds);
-	S = "KILLCAM: " $ GP.KillcamName;
-	Canvas.Font = Canvas.MedFont;
-	Canvas.TextSize(S, XL, YL);
-	Canvas.SetDrawColor(255, 255, 255, int(220 * Alpha));
-	Canvas.SetPos(Canvas.ClipX * 0.5 - XL * 0.5, Canvas.ClipY * 0.12);
 	Canvas.DrawText(S);
 }
 
@@ -2646,55 +2594,6 @@ simulated final function DrawDeathRecap(canvas Canvas, GoldSrcPlayer GP)
 		Canvas.DrawText(S);
 		Y += YL + 2;
 	}
-}
-
-// --- spectator HUD ---------------------------------------------------------------------
-
-simulated final function DrawSpectatorHUD(canvas Canvas)
-{
-	local float XL, YL;
-	local string S;
-
-	if (PlayerOwner == None || !bSpectatorHUD)
-		return;
-
-	if (PlayerOwner.PlayerReplicationInfo == None)
-		return;
-	if (!PlayerOwner.PlayerReplicationInfo.bOnlySpectator
-		&& !(PlayerOwner.Pawn == None && PlayerOwner.ViewTarget != None
-		     && Pawn(PlayerOwner.ViewTarget) != None && Pawn(PlayerOwner.ViewTarget).Controller != PlayerOwner))
-		return;
-
-	if (PlayerOwner.ViewTarget != None && PlayerOwner.ViewTarget != PlayerOwner.Pawn)
-	{
-		S = "SPECTATING  " $ SpectateeName();
-		Canvas.Font = Canvas.MedFont;
-		Canvas.TextSize(S, XL, YL);
-		Canvas.SetDrawColor(255, 255, 255, 230);
-		Canvas.SetPos(Canvas.ClipX * 0.5 - XL * 0.5, Canvas.ClipY * 0.08);
-		Canvas.DrawText(S);
-	}
-	else
-	{
-		S = "SPECTATOR";
-		Canvas.Font = Canvas.MedFont;
-		Canvas.TextSize(S, XL, YL);
-		Canvas.SetDrawColor(255, 255, 255, 230);
-		Canvas.SetPos(Canvas.ClipX * 0.5 - XL * 0.5, Canvas.ClipY * 0.08);
-		Canvas.DrawText(S);
-	}
-}
-
-simulated final function string SpectateeName()
-{
-	local Pawn P;
-
-	P = Pawn(PlayerOwner.ViewTarget);
-	if (P == None)
-		return "...";
-	if (P.PlayerReplicationInfo != None)
-		return P.PlayerReplicationInfo.PlayerName;
-	return string(P.Name);
 }
 
 // --- stats panel (Tab) / modern scoreboard / MVP card ------------------------------------
@@ -2945,17 +2844,14 @@ defaultproperties
 	bMultikillPips=true
 	bDeathRecap=true
 	bPickupTimers=true
-	bDesaturate=true
 	bModernScoreboard=true
 	bMVPCard=true
-	bSpectatorHUD=true
 	FeedColor=(R=180,G=180,B=180,A=255)
 	MyFeedColor=(R=255,G=220,B=120,A=255)
 	FeedSelfColor=(R=255,G=90,B=90,A=255)
 	ArrowColor=(R=255,G=80,B=60,A=255)
 	HPBarColor=(R=90,G=220,B=90,A=255)
 	ShieldBarColor=(R=110,G=190,B=255,A=255)
-	VignetteColor=(R=90,G=100,B=120,A=255)
 	HudMinAlpha=200.0
 	HudScale=0.85
 	HudFontSize=1

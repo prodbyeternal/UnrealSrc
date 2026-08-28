@@ -18,9 +18,6 @@ var float   LastJumpPadTime;
 // latches, session stats, per-life damage breakdown, revenge target, RJ stats.
 
 var Pawn  RevengeTarget;       // last player who killed us, marker until answered
-var float KillcamEnd;          // killcam active until this TimeSeconds
-var name  KillcamState;        // state to return to when the killcam ends
-var string KillcamName;        // whose POV we are on
 
 var float RecapShowUntil;      // death recap panel visible until
 var string RecapKiller;
@@ -38,8 +35,6 @@ var int StatKills, StatDeaths, StatDamageDealt, StatDamageTaken;
 var int StatShotsFired, StatShotsHit;   // accuracy (instant-hit only is fine)
 var int StatStreak, StatBestStreak;
 var config bool bRJStats;      // cl_rjstats -- rocket-jump/boost stat popup
-var config bool bKillcam;      // cl_killcam -- 2s from the killer's eyes on death
-var bool  bKillcamActive;
 
 var config bool bGoldSrcMovement;   // Master enable
 var config bool bShowSpeedometer;
@@ -303,9 +298,8 @@ function Possess(Pawn aPawn)
 
 	bMoveInitialized = false;
 
-	// fresh life: clear the per-life recap rows and the killcam
+	// fresh life: clear the per-life recap rows
 	RecapRows = 0;
-	EndKillcam();
 
 	if (bGoldSrcMovement)
 		GotoState('PlayerGoldSrcWalking');
@@ -1283,7 +1277,6 @@ function NoteKill(Controller Killer, Controller Victim, class<DamageType> Damage
 			RecapKillerHP = Killer.Pawn.Health;
 			if (Pawn != None)
 				RecapDist = VSize(Killer.Pawn.Location - Pawn.Location);
-			StartKillcam(Killer);
 		}
 		else
 			RevengeTarget = None;
@@ -1343,35 +1336,6 @@ function float GetAccuracy()
 	if (StatShotsFired <= 0)
 		return 0.0;
 	return 100.0 * float(StatShotsHit) / float(StatShotsFired);
-}
-
-// Killcam: park the dead player's view on their killer's pawn for 2 seconds.
-// Called from our Dead-state override of Fire (i.e. any attempt to respawn
-// early skips it), and auto-clears by timer.
-function StartKillcam(Controller Killer)
-{
-	if (Killer == None || Killer.Pawn == None || !bGoldSrcMovement || !bKillcam)
-		return;
-
-	bKillcamActive = true;
-	KillcamEnd     = Level.TimeSeconds + 2.0;
-	KillcamName    = "?";
-	if (Killer.PlayerReplicationInfo != None)
-		KillcamName = Killer.PlayerReplicationInfo.PlayerName;
-
-	SetViewTarget(Killer.Pawn);
-	bBehindView    = false;
-}
-
-function EndKillcam()
-{
-	if (!bKillcamActive)
-		return;
-
-	bKillcamActive = false;
-	KillcamEnd     = 0.0;
-	SetViewTarget(None);
-	bBehindView    = true;
 }
 
 // RJ/boost stats: hooked from DamageKnockback when a self-blast has real lift.
@@ -1988,28 +1952,6 @@ exec function cl_pickuptimers(optional string OnOff)
 	ClientMessage("cl_pickuptimers:" @ OnOffStr(H.bPickupTimers));
 }
 
-exec function cl_desaturate(optional string OnOff)
-{
-	local GoldSrcHUD H;
-
-	H = GoldSrcHUD(myHUD);
-	if (H == None) return;
-	if (OnOff == "0")      H.bDesaturate = false;
-	else if (OnOff != "")  H.bDesaturate = true;
-	else                   H.bDesaturate = !H.bDesaturate;
-	H.SaveConfig();
-	ClientMessage("cl_desaturate:" @ OnOffStr(H.bDesaturate));
-}
-
-exec function cl_killcam(optional string OnOff)
-{
-	if (OnOff == "0")      bKillcam = false;
-	else if (OnOff != "")  bKillcam = true;
-	else                   bKillcam = !bKillcam;
-	SaveConfig();
-	ClientMessage("cl_killcam:" @ OnOffStr(bKillcam));
-}
-
 exec function cl_scoreboard(optional string OnOff)
 {
 	local GoldSrcHUD H;
@@ -2034,19 +1976,6 @@ exec function cl_mvpcard(optional string OnOff)
 	else                   H.bMVPCard = !H.bMVPCard;
 	H.SaveConfig();
 	ClientMessage("cl_mvpcard:" @ OnOffStr(H.bMVPCard));
-}
-
-exec function cl_spectatorhud(optional string OnOff)
-{
-	local GoldSrcHUD H;
-
-	H = GoldSrcHUD(myHUD);
-	if (H == None) return;
-	if (OnOff == "0")      H.bSpectatorHUD = false;
-	else if (OnOff != "")  H.bSpectatorHUD = true;
-	else                   H.bSpectatorHUD = !H.bSpectatorHUD;
-	H.SaveConfig();
-	ClientMessage("cl_spectatorhud:" @ OnOffStr(H.bSpectatorHUD));
 }
 
 exec function cl_rjstats(optional string OnOff)
@@ -3303,10 +3232,6 @@ function CalcFirstPersonView(out vector CameraLocation, out rotator CameraRotati
 // GoldSrc state whenever we find ourselves parked in one of the movement states.
 function PlayerTick(float DeltaTime)
 {
-	// Killcam expiry: lazy, so no timer is hijacked.
-	if (bKillcamActive && Level.TimeSeconds >= KillcamEnd)
-		EndKillcam();
-
 	// Reclaim PHYS_None BEFORE Super.PlayerTick, which dispatches into native
 	// movement. Pawn.TakeDamage can stomp us to PHYS_Walking mid-damage-call, and
 	// the pawn's native tick can then walk-step and floor-snap against a hull it
@@ -3380,7 +3305,6 @@ defaultproperties
 	bGoldSrcFootSteps=true
 	bDamageIndicator=true
 	bRJStats=true
-	bKillcam=true
 	MoveAxisMax=300.0           // UT2004's shipped movement bind deflection
 	DuckPulseSeconds=0.12
 }

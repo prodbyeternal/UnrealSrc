@@ -11,9 +11,9 @@ var automated GUIButton b_Close;
 
 var automated moCheckBox ck_Hitmarker, ck_DamageNumbers, ck_Killfeed;
 var automated moCheckBox ck_ArrowRing, ck_EnemyHPBar, ck_RevengeMarker;
-var automated moCheckBox ck_MultikillPips, ck_DeathRecap, ck_Killcam;
-var automated moCheckBox ck_PickupTimers, ck_Desaturate, ck_Scoreboard;
-var automated moCheckBox ck_MVPCard, ck_SpectatorHUD, ck_RJStats;
+var automated moCheckBox ck_MultikillPips, ck_DeathRecap;
+var automated moCheckBox ck_PickupTimers, ck_Scoreboard;
+var automated moCheckBox ck_MVPCard, ck_RJStats;
 var automated moCheckBox ck_Speedo, ck_ViewmodelBob;
 
 function InitComponent(GUIController MyController, GUIComponent MyOwner)
@@ -36,13 +36,9 @@ function InitComponent(GUIController MyController, GUIComponent MyOwner)
 	ck_RevengeMarker.SetComponentValue(string(H.bRevengeMarker));
 	ck_MultikillPips.SetComponentValue(string(H.bMultikillPips));
 	ck_DeathRecap.SetComponentValue(string(H.bDeathRecap));
-	if (GoldSrcPlayer(PlayerOwner()) != None)
-		ck_Killcam.SetComponentValue(string(GoldSrcPlayer(PlayerOwner()).bKillcam));
 	ck_PickupTimers.SetComponentValue(string(H.bPickupTimers));
-	ck_Desaturate.SetComponentValue(string(H.bDesaturate));
 	ck_Scoreboard.SetComponentValue(string(H.bModernScoreboard));
 	ck_MVPCard.SetComponentValue(string(H.bMVPCard));
-	ck_SpectatorHUD.SetComponentValue(string(H.bSpectatorHUD));
 	ck_Speedo.SetComponentValue(string(GoldSrcPlayer(PlayerOwner()).bShowSpeedometer));
 	ck_ViewmodelBob.SetComponentValue(string(GoldSrcPlayer(PlayerOwner()).bViewModelBob));
 }
@@ -73,12 +69,9 @@ function CheckBoxChanged(GUIComponent Sender)
 	else if (Sender == ck_RevengeMarker) H.bRevengeMarker = ck_RevengeMarker.IsChecked();
 	else if (Sender == ck_MultikillPips) H.bMultikillPips = ck_MultikillPips.IsChecked();
 	else if (Sender == ck_DeathRecap)  H.bDeathRecap = ck_DeathRecap.IsChecked();
-	else if (Sender == ck_Killcam && GP != None) GP.bKillcam = ck_Killcam.IsChecked();
 	else if (Sender == ck_PickupTimers) H.bPickupTimers = ck_PickupTimers.IsChecked();
-	else if (Sender == ck_Desaturate)  H.bDesaturate = ck_Desaturate.IsChecked();
 	else if (Sender == ck_Scoreboard)  H.bModernScoreboard = ck_Scoreboard.IsChecked();
 	else if (Sender == ck_MVPCard)     H.bMVPCard = ck_MVPCard.IsChecked();
-	else if (Sender == ck_SpectatorHUD) H.bSpectatorHUD = ck_SpectatorHUD.IsChecked();
 	else if (Sender == ck_RJStats && GP != None) GP.bRJStats = ck_RJStats.IsChecked();
 	else if (Sender == ck_Speedo && GP != None) GP.bShowSpeedometer = ck_Speedo.IsChecked();
 	else if (Sender == ck_ViewmodelBob && GP != None) GP.bViewModelBob = ck_ViewmodelBob.IsChecked();
@@ -179,14 +172,6 @@ defaultproperties
 	End Object
 	ck_DeathRecap=ckDeathRecap
 
-	Begin Object Class=moCheckBox Name=ckKillcam
-		Caption="Killcam (2s)"
-		WinWidth=0.44
-		WinLeft=0.03
-		WinTop=0.30
-		OnChange=GoldSrcSettingsPage.CheckBoxChanged
-	End Object
-	ck_Killcam=ckKillcam
 
 	Begin Object Class=moCheckBox Name=ckPickupTimers
 		Caption="Pickup Respawn Timers"
@@ -197,14 +182,6 @@ defaultproperties
 	End Object
 	ck_PickupTimers=ckPickupTimers
 
-	Begin Object Class=moCheckBox Name=ckDesaturate
-		Caption="Low-HP Desaturation"
-		WinWidth=0.44
-		WinLeft=0.03
-		WinTop=0.36
-		OnChange=GoldSrcSettingsPage.CheckBoxChanged
-	End Object
-	ck_Desaturate=ckDesaturate
 
 	Begin Object Class=moCheckBox Name=ckScoreboard
 		Caption="Modern Scoreboard"
@@ -224,14 +201,6 @@ defaultproperties
 	End Object
 	ck_MVPCard=ckMVPCard
 
-	Begin Object Class=moCheckBox Name=ckSpectatorHUD
-		Caption="Spectator HUD"
-		WinWidth=0.44
-		WinLeft=0.53
-		WinTop=0.42
-		OnChange=GoldSrcSettingsPage.CheckBoxChanged
-	End Object
-	ck_SpectatorHUD=ckSpectatorHUD
 
 	Begin Object Class=moCheckBox Name=ckRJStats
 		Caption="Rocket-Jump Stats"
