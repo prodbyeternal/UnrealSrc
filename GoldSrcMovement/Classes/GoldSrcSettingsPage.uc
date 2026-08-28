@@ -1,4 +1,3 @@
-
 class GoldSrcSettingsPage extends GUIPage;
 
 #exec OBJ LOAD FILE=GUI2K4A.utx
