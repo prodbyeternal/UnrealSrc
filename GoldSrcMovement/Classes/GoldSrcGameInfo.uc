@@ -13,7 +13,7 @@ function int ReduceDamage(int Damage, pawn injured, pawn instigatedBy,
 	vector HitLocation, out vector Momentum, class<DamageType> DamageType)
 {
 	local GoldSrcPlayer GP;
-	local int           Actual;
+	local int           Actual, ShieldPart;
 	local bool          bWouldKill;
 
 	// Combat feedback for the attacker: this is the one place in the engine
@@ -31,7 +31,14 @@ function int ReduceDamage(int Damage, pawn injured, pawn instigatedBy,
 			Actual     = Super.ReduceDamage(Damage, injured, instigatedBy, HitLocation, Momentum, DamageType);
 			bWouldKill = (injured.Health - Actual <= 0);
 
-			GP.NotifyEnemyHit(injured, HitLocation, Actual, bWouldKill);
+			// Shield split: ReduceDamage runs BEFORE ShieldAbsorb, so the
+			// victim's current shield strength is the best estimate of how
+			// much of this hit the shield is about to eat.
+			ShieldPart = injured.ShieldStrength;
+			if (ShieldPart > Actual)
+				ShieldPart = Actual;
+
+			GP.NotifyEnemyHit(injured, HitLocation, Actual, ShieldPart, bWouldKill);
 
 			return Actual;
 		}
@@ -58,6 +65,22 @@ function int ReduceDamage(int Damage, pawn injured, pawn instigatedBy,
 	}
 
 	return Super.ReduceDamage(Damage, injured, instigatedBy, HitLocation, Momentum, DamageType);
+}
+
+// Kill events: one broadcast to every GoldSrcPlayer, which fans out to the
+// killfeed on each HUD, plus the killer/victim bookkeeping (stats, revenge
+// latch, death recap, killcam) that lives on the involved controllers.
+function Killed(Controller Killer, Controller Killed, Pawn KilledPawn, class<DamageType> damageType)
+{
+	local Controller C;
+
+	Super.Killed(Killer, Killed, KilledPawn, damageType);
+
+	for (C = Level.ControllerList; C != None; C = C.NextController)
+	{
+		if (GoldSrcPlayer(C) != None)
+			GoldSrcPlayer(C).NoteKill(Killer, Killed, damageType);
+	}
 }
 
 defaultproperties

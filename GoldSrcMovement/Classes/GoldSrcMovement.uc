@@ -569,14 +569,19 @@ final function bool BlocksPlayer(Actor A)
 }
 
 // Remember the last thing that walled a move off, for the movedebug overlay's
-// "touch" row. Diagnostic only: nothing in the simulation reads any of it.
+// "touch" row. RETIRED -- see the note after ResolveBlockInfo for why.
 final function NoteBlocker(Actor A, vector N, optional bool bProbe)
 {
-	// The reads below run on whatever the trace hit, including actors a prior
-	// frame destroyed (gibbed corpses, broken decorations). Reading members off
-	// a destroyed-but-not-yet-collected reference is a hard native crash (GPF
-	// in UObject::CallFunction -- this exact function took the game down on
-	// DM-DesertIsle), so destroyed actors are not recorded at all.
+	// Retired, no call sites -- kept only so the movedebug row has a stable
+	// "nothing yet" to read. The actor a TraceActors iteration returns on this
+	// engine build can be an already-collected reference, and ANY member read
+	// on such a reference -- even the bDeleteMe guard below -- is a hard native
+	// GPF (UObject::CallFunction). This function took the game down on
+	// DM-DesertIsle and DM-Rrajigar before its call sites were removed; do not
+	// re-add them without solving that first.
+	if (true)
+		return;
+
 	if (A == None || A.bDeleteMe || TraceOwner == None)
 		return;
 
@@ -621,6 +626,15 @@ final function ResolveBlockInfo()
 	BlockIsVolume = (Volume(BlockActor) != None);
 }
 
+// NOTE: nothing calls NoteBlocker anymore. It stays because the movedebug
+// "touch" row still renders whatever was last resolved, and because the reason
+// it was retired is worth keeping in one piece: on this engine build (v3374
+// Preview) the TraceActors iterator can hand back actors that were already
+// collected, and reading ANY member off such a reference -- including a
+// bDeleteMe guard -- is a native GPF. The swept path never reads members of
+// iterator results anymore; if this diagnostic ever comes back, it must not
+// either.
+
 final function PM_PlayerTrace(vector vStart, vector vEnd)
 {
 	local vector HitLocation, HitNormal, Extent, Delta, Dir;
@@ -653,10 +667,7 @@ final function PM_PlayerTrace(vector vStart, vector vEnd)
 			TraceStartSolid = true;
 			TraceAllSolid   = true;
 			TraceFraction   = 0.0;
-
-			// The whole point of the diagnostic: this branch is the one that fires
-			// while the player cannot move at all.
-			NoteBlocker(HitActor, vect(0,0,0), true);
+			// (blocker diagnostic removed -- see the note by TraceHitActor below)
 		}
 		return;
 	}
@@ -737,11 +748,11 @@ final function PM_PlayerTrace(vector vStart, vector vEnd)
 	TraceHitActor    = BestActor;
 	TracePlaneNormal = BestNormal;
 
-	// Diagnostic only. A floor is not interesting -- the ground row already names
-	// that one -- so only walls and ceilings are recorded here, which is what an
-	// invisible thing you cannot walk past looks like from inside the tracer.
-	if (BestNormal.Z < PM_MAX_CLIMB_NORMAL)
-		NoteBlocker(BestActor, BestNormal);
+	// NOTE: the blocker diagnostic used to be recorded here (and in the two
+	// embedded-probe branches below). The actor a trace returns can be a
+	// dangling, already-collected reference on some maps, and ANY member read
+	// on it -- even a bDeleteMe guard -- is a hard native GPF. Nothing in the
+	// simulation reads that data, so the calls are gone.
 
 	DistMoved = BestDist;
 
@@ -769,8 +780,7 @@ final function PM_PlayerTrace(vector vStart, vector vEnd)
 		HitActor      = TraceOwner.Trace(HitLocation, HitNormal, vStart, vStart, true, Extent);
 		TraceAllSolid = BlocksPlayer(HitActor);
 
-		if (TraceAllSolid)
-			NoteBlocker(HitActor, HitNormal, true);
+		// (blocker diagnostic removed -- see the note by TraceHitActor above)
 	}
 }
 

@@ -128,7 +128,6 @@ const HL_BAR_FRAC = 16.0; // health.cpp uses HealthWidth/10, thinner reads bette
 var float HealthFade, ArmorFade, AmmoFade; // one per elem.
 var int LastHealth, LastArmor, LastAmmo;   // what fade we're watching
 
-// --- Modern DM combat feedback: hitmarker + floating damage counters --------
 
 var config bool bHitmarker;       // cl_hitmarker 1
 var config bool bDamageNumbers;   // cl_dmgnumbers 1
@@ -139,6 +138,8 @@ const HITMARKER_TIME  = 0.35;     // seconds the marker holds
 const HITMARKER_GAP   = 7.0;      // inner gap of the X from center, pixels at 600p
 const HITMARKER_LEN   = 9.0;      // arm length
 const HITMARKER_THICK = 2.0;
+const HITMARKER_STEPS = 12;       // steps per arm: 1-unit stair, reads as a smooth line
+const HITMARKER_POP   = 0.09;     // seconds of expand "pop" before the fade takes over
 
 const DMGNUM_TIME     = 1.1;      // lifetime of a floating number
 const DMGNUM_RISE     = 34.0;     // units it climbs over that lifetime
@@ -150,6 +151,7 @@ struct DmgNum
 {
 	var vector WorldLoc;   // where it spawned (world space, tracked so turning keeps it anchored)
 	var int    Amount;     // damage dealt, rounded at draw time
+	var int    Shield;     // the portion of it that went into the victim's shield
 	var bool   bKill;      // red + bigger
 	var float  SpawnTime;
 	var float  DriftX;     // cached jitter, so the drift direction is stable
@@ -163,10 +165,87 @@ var bool  HitKill;
 
 var float HudFadeTime, AmmoFadeTime;       // stand-in for fps
 
-// --- Modern DM combat feedback: hitmarker + floating damage counters --------
+
+// killfeed, damage-direction arrow ring, enemy HP bars, revenge marker,
+// multikill pips, low-HP desaturation, death recap / killcam label, pickup
+// respawn timers, custom scoreboard + stats panel, MVP card, spectator strip.
+// All cl_-toggleable, all default on.
+
+var config bool bKillfeed;
+var config bool bArrowRing;       // replaces the HL pain wedges while on
+var config bool bEnemyHPBar;
+var config bool bRevengeMarker;
+var config bool bMultikillPips;
+var config bool bDeathRecap;
+var config bool bPickupTimers;
+var config bool bDesaturate;
+var config bool bModernScoreboard; // replaces the stock board while Tab is held
+var config bool bMVPCard;
+var config bool bSpectatorHUD;
+
+var config color FeedColor;       // other players' kills
+var config color MyFeedColor;     // kills we were part of
+var config color FeedSelfColor;   // our own death
+var config color ArrowColor;
+var config color HPBarColor;
+var config color ShieldBarColor;
+var config color VignetteColor;
+
+const KILLFEED_MAX  = 6;
+const KILLFEED_TIME = 6.0;
+const ARROWS_MAX    = 4;
+const ARROW_TIME    = 3.0;
+const ARROW_RING_R  = 52.0;      // ring radius, px at 600p
+const ARROW_STEPS   = 8;
+const HPBAR_TIME    = 3.0;
+const HPBAR_W       = 70.0;
+const HPBAR_H       = 5.0;
+const HPBAR_MAX     = 4;
+const PICKUP_MAX    = 24;
+const PICKUP_SCAN   = 0.5;       // seconds between pickup hidden/visible polls
+const VIGNETTE_HP   = 25;        // desaturation starts under this health
+
+struct KillFeedEntry
+{
+	var string Killer;
+	var string Victim;
+	var string Weapon;
+	var bool   bSuicide;
+	var bool   bMine;      // we were the killer or the victim
+	var float  Time;
+};
+
+struct ArrowHit
+{
+	var vector Dir;        // world-space, player -> attacker, latched at hit time
+	var float  Time;
+};
+
+struct HPTrackEntry
+{
+	var Pawn   Victim;
+	var float  Time;       // last time we damaged them
+};
+
+struct PickupTrack
+{
+	var Pickup Pickup;
+	var string Label;
+	var float  HiddenSince; // 0 = sitting there visible
+	var float  Respawn;     // its RespawnTime
+};
+
+var KillFeedEntry KillFeed[KILLFEED_MAX];
+var ArrowHit      Arrows[ARROWS_MAX];
+var HPTrackEntry  HPTracks[HPBAR_MAX];
+var PickupTrack   PickupList[PICKUP_MAX];
+var float         NextPickupScan;
+var float         RJHeight, RJSpeed, RJTime;   // rocket-jump / boost stats popup
+
 
 // Called by the player controller every time OUR shot lands on an enemy.
-simulated function NoteEnemyHit(vector HitLocation, int Damage, bool bKilled)
+simulated function NoteEnemyHit(Pawn Victim, vector HitLocation, int Damage,
+	int ShieldDamage, bool bKilled)
 {	local int    i, Oldest;
 	local float  BestAge;
 	local vector HitLoc;
@@ -175,6 +254,25 @@ simulated function NoteEnemyHit(vector HitLocation, int Damage, bool bKilled)
 	{
 		HitTime  = Level.TimeSeconds;
 		HitKill  = bKilled;
+	}
+
+	// Enemy HP bar: latch the victim so the bar can hang over their head for
+	// a few seconds and fade. Same victim refreshes in place.
+	if (Victim != None && bEnemyHPBar)
+	{
+		Oldest = -1;
+		for (i = 0; i < HPBAR_MAX; i++)
+		{
+			if (HPTracks[i].Victim == Victim)
+			{
+				Oldest = i;
+				break;
+			}
+			if (Oldest < 0 || Level.TimeSeconds - HPTracks[i].Time > Level.TimeSeconds - HPTracks[Oldest].Time)
+				Oldest = i;
+		}
+		HPTracks[Oldest].Victim = Victim;
+		HPTracks[Oldest].Time   = Level.TimeSeconds;
 	}
 
 	if (!bDamageNumbers || Damage <= 0)
@@ -201,6 +299,7 @@ simulated function NoteEnemyHit(vector HitLocation, int Damage, bool bKilled)
 
 	DmgNums[Oldest].WorldLoc  = HitLoc;
 	DmgNums[Oldest].Amount    = Damage;
+	DmgNums[Oldest].Shield    = Clamp(ShieldDamage, 0, Damage);
 	DmgNums[Oldest].bKill     = bKilled;
 	DmgNums[Oldest].SpawnTime = Level.TimeSeconds;
 	// Pseudo-jitter from the location: no Math.random-style calls exist on
@@ -210,44 +309,68 @@ simulated function NoteEnemyHit(vector HitLocation, int Damage, bool bKilled)
 
 simulated final function DrawHitmarker(canvas Canvas)
 {
-	local float CX, CY, Scale, Alpha;
-	local int    i;
+	local float CX, CY, Scale, Alpha, Age, Grow, Dist, StepAlpha, Thick;
+	local int   i, SgnX, SgnY, Arm;
+	local color C;
 
-	if (Level.TimeSeconds - HitTime > HITMARKER_TIME)
+	Age = Level.TimeSeconds - HitTime;
+	if (Age > HITMARKER_TIME)
 		return;
 
 	CX    = Canvas.ClipX * 0.5;
 	CY    = Canvas.ClipY * 0.5;
 	Scale = FMax(Canvas.ClipY / 600.0, 0.5);
 
-	Alpha = 1.0 - (Level.TimeSeconds - HitTime) / HITMARKER_TIME;
-
 	if (HitKill)
-		Canvas.SetDrawColor(KillColor.R, KillColor.G, KillColor.B, int(255 * Alpha));
+		C = KillColor;
 	else
-		Canvas.SetDrawColor(HitColor.R, HitColor.G, HitColor.B, int(255 * Alpha));
+		C = HitColor;
+
+	// Pop: the marker snaps in slightly oversized and settles to rest during
+	// the first HITMARKER_POP seconds, then the whole thing fades out.
+	Alpha = 1.0 - Age / HITMARKER_TIME;
+	Grow  = 1.0;
+	if (Age < HITMARKER_POP)
+		Grow = 1.0 + 0.5 * Square(1.0 - Age / HITMARKER_POP);
+
+	Thick = HITMARKER_THICK * Scale;
+	if (HitKill)
+		Thick *= 1.35;
 
 	// The engine's DrawRect is axis-aligned only, so each diagonal arm of the
-	// X is built as a short stair of small squares -- 4 steps reads as a clean
-	// 45-degree line at any resolution.
-	for (i = 0; i < 4; i++)
+	// X is built as a stair of tiny squares. HITMARKER_STEPS 1-unit steps with
+	// an alpha taper toward the tip read as a thin anti-aliased line at any
+	// resolution -- no visible pixel staircase.
+	for (Arm = 0; Arm < 4; Arm++)
 	{
-		Canvas.SetPos(CX + (HITMARKER_GAP + i * 2.2) * Scale,
-		              CY + (HITMARKER_GAP + i * 2.2) * Scale);
-		Canvas.DrawRect(Texture'Engine.WhiteSquareTexture',
-			2.4 * Scale, 2.4 * Scale);
-		Canvas.SetPos(CX - (HITMARKER_GAP + i * 2.2) * Scale - 2.4 * Scale,
-		              CY + (HITMARKER_GAP + i * 2.2) * Scale);
-		Canvas.DrawRect(Texture'Engine.WhiteSquareTexture',
-			2.4 * Scale, 2.4 * Scale);
-		Canvas.SetPos(CX + (HITMARKER_GAP + i *2.2) * Scale,
-		              CY - (HITMARKER_GAP + i * 2.2) * Scale - 2.4 * Scale);
-		Canvas.DrawRect(Texture'Engine.WhiteSquareTexture',
-			2.4 * Scale, 2.4 * Scale);
-		Canvas.SetPos(CX - (HITMARKER_GAP + i * 2.2) * Scale - 2.4 * Scale,
-		              CY - (HITMARKER_GAP + i * 2.2) * Scale - 2.4 * Scale);
-		Canvas.DrawRect(Texture'Engine.WhiteSquareTexture',
-			2.4 * Scale, 2.4 * Scale);
+		if (Arm == 0)      { SgnX =  1; SgnY =  1; }
+		else if (Arm == 1) { SgnX = -1; SgnY =  1; }
+		else if (Arm == 2) { SgnX =  1; SgnY = -1; }
+		else               { SgnX = -1; SgnY = -1; }
+
+		for (i = 0; i < HITMARKER_STEPS; i++)
+		{
+			// 0 at the inner gap, 1 at the arm tip.
+			Dist = (HITMARKER_GAP + HITMARKER_LEN * float(i) / float(HITMARKER_STEPS - 1))
+			       * Scale * Grow;
+
+			// Taper: full brightness at the base, ~25% at the tip -- this is
+			// what sells it as a line instead of a row of blocks.
+			StepAlpha = Alpha * (1.0 - 0.75 * float(i) / float(HITMARKER_STEPS - 1));
+
+			Canvas.SetDrawColor(C.R, C.G, C.B, int(255.0 * StepAlpha));
+			Canvas.SetPos(CX + SgnX * Dist - Thick * 0.5,
+			              CY + SgnY * Dist - Thick * 0.5);
+			Canvas.DrawRect(Texture'Engine.WhiteSquareTexture', Thick, Thick);
+		}
+	}
+
+	// Kill confirmation: a filled dot in the middle of the X.
+	if (HitKill)
+	{
+		Canvas.SetDrawColor(C.R, C.G, C.B, int(255.0 * Alpha));
+		Canvas.SetPos(CX - Thick, CY - Thick);
+		Canvas.DrawRect(Texture'Engine.WhiteSquareTexture', Thick * 2.0, Thick * 2.0);
 	}
 }
 
@@ -289,6 +412,19 @@ simulated final function DrawDamageNumbers(canvas Canvas)
 			Canvas.SetDrawColor(HitColor.R, HitColor.G, HitColor.B, int(200 * Fade));
 
 		Canvas.DrawText(S);
+
+		// Shield split: the part that went into the shield rides under the
+		// number in the shield color, so "42 / +15 shield" reads at a glance.
+		if (DmgNums[i].Shield > 0)
+		{
+			S = "+" $ string(DmgNums[i].Shield);
+			Canvas.Font = Canvas.SmallFont;
+			Canvas.TextSize(S, XL, YL);
+			Canvas.SetPos(Screen.X - XL * 0.5 + DmgNums[i].DriftX * Age / DMGNUM_TIME,
+			              Screen.Y + YL * 0.25 - DMGNUM_RISE * Age / DMGNUM_TIME);
+			Canvas.SetDrawColor(ShieldBarColor.R, ShieldBarColor.G, ShieldBarColor.B, int(200 * Fade));
+			Canvas.DrawText(S);
+		}
 	}
 }
 
@@ -299,9 +435,24 @@ simulated final function DrawDamageNumbers(canvas Canvas)
 
 simulated event PostRender(canvas Canvas)
 {
+	local Scoreboard SavedBoard;
+
 	BobHUDCalls++;
 	ApplyViewModelBob();
-	Super.PostRender(Canvas);
+
+	// While our modern scoreboard is up, the stock board must not draw
+	// underneath it. The engine draws HUD.ScoreBoard directly when
+	// bShowScoreBoard is set, so park the actor for the duration of the pass.
+	if (bModernScoreboard && bShowScoreBoard)
+	{
+		SavedBoard = ScoreBoard;
+		ScoreBoard = None;
+		Super.PostRender(Canvas);
+		ScoreBoard = SavedBoard;
+	}
+	else
+		Super.PostRender(Canvas);
+
 	RestoreViewModelBob();
 }
 
@@ -693,8 +844,9 @@ simulated final function DrawGoldSrcOverlay(canvas Canvas)
 		DrawShowPos(Canvas, GP.Move);
 
 	// Before the Move check below: a hit lands the same whether or not the
-	// simulation is the thing that's driving.
-	if (GP.bDamageIndicator)
+	// simulation is the thing that's driving. The modern arrow ring replaces
+	// the ported HL wedges while it is on; cl_damageindicator still gates both.
+	if (GP.bDamageIndicator && !bArrowRing)
 		DrawPain(Canvas);
 
 	// Combat feedback rides on top of everything, crosshair included.
@@ -703,6 +855,32 @@ simulated final function DrawGoldSrcOverlay(canvas Canvas)
 
 	if (bHitmarker)
 		DrawHitmarker(Canvas);
+
+	// whole screen, everything else rides on top of it.
+	DrawDesat(Canvas);
+
+	if (bArrowRing && GP.bDamageIndicator)
+		DrawArrowRing(Canvas);
+
+	if (bKillfeed)
+		DrawKillfeed(Canvas);
+
+	if (bEnemyHPBar)
+		DrawEnemyHPBar(Canvas);
+
+	if (bRevengeMarker)
+		DrawRevengeMarker(Canvas, GP);
+
+	if (bMultikillPips)
+		DrawMultikillPips(Canvas, GP);
+
+	if (bPickupTimers)
+		DrawPickupTimers(Canvas);
+
+	DrawKillcamLabel(Canvas, GP);
+	DrawDeathRecap(Canvas, GP);
+	DrawSpectatorHUD(Canvas);
+	DrawRJPopup(Canvas, GP);
 
 	M = GP.Move;
 	if (M == None)
@@ -728,6 +906,10 @@ simulated final function DrawGoldSrcOverlay(canvas Canvas)
 		DrawGoldSrcArmor(Canvas, FClamp(Level.TimeSeconds - HudFadeTime, 0.0, 0.1));
 		DrawGoldSrcAmmo(Canvas);
 	}
+
+	// Full-screen panels go on top of absolutely everything.
+	DrawScorePanel(Canvas);
+	DrawMVPCard(Canvas);
 }
 
 simulated final function ClearDamageDirection()
@@ -1955,6 +2137,780 @@ simulated final function string OverlapStr(Pawn P)
 	return S;
 }
 
+// --- killfeed ----------------------------------------------------------------
+// One entry per kill: "Killer  [weapon]  Victim". The list scrolls down as
+// entries expire; ours are highlighted.
+
+simulated function NoteKill(string Killer, string Victim, string Weapon,
+	bool bSuicide, bool bMine)
+{
+	local int i;
+
+	// Shift down: the newest entry takes slot 0, the oldest falls off.
+	for (i = KILLFEED_MAX - 1; i > 0; i--)
+		KillFeed[i] = KillFeed[i - 1];
+
+	KillFeed[0].Killer   = Killer;
+	KillFeed[0].Victim   = Victim;
+	KillFeed[0].Weapon   = Weapon;
+	KillFeed[0].bSuicide = bSuicide;
+	KillFeed[0].bMine    = bMine;
+	KillFeed[0].Time     = Level.TimeSeconds;
+}
+
+simulated final function DrawKillfeed(canvas Canvas)
+{
+	local int   i, Line;
+	local float Y, XL, YL, Fade;
+	local color C;
+	local string S;
+
+	for (i = 0; i < KILLFEED_MAX; i++)
+	{
+		if (KillFeed[i].Killer == "" && KillFeed[i].Victim == "")
+			continue;
+
+		Fade = 1.0 - (Level.TimeSeconds - KillFeed[i].Time) / KILLFEED_TIME;
+		if (Fade <= 0.0)
+		{
+			KillFeed[i].Killer = "";
+			KillFeed[i].Victim = "";
+			continue;
+		}
+
+		if (KillFeed[i].bSuicide)
+			S = KillFeed[i].Victim $ "  " $ KillFeed[i].Weapon;
+		else
+			S = KillFeed[i].Killer $ "  " $ KillFeed[i].Weapon $ "  " $ KillFeed[i].Victim;
+
+		Canvas.Font = Canvas.SmallFont;
+		Canvas.TextSize(S, XL, YL);
+
+		if (KillFeed[i].bMine)
+			C = MyFeedColor;
+		else
+			C = FeedColor;
+
+		Y = 24 + Line * (YL + 4);
+		Canvas.SetDrawColor(0, 0, 0, int(140 * Fade));
+		Canvas.SetPos(Canvas.ClipX - XL - 22, Y + 1);
+		Canvas.DrawRect(Texture'Engine.WhiteSquareTexture', XL + 12, YL + 2);
+		Canvas.SetDrawColor(C.R, C.G, C.B, int(255 * Fade));
+		Canvas.SetPos(Canvas.ClipX - XL - 16, Y);
+		Canvas.DrawText(S);
+		Line++;
+	}
+}
+
+// --- damage-direction arrow ring ----------------------------------------------
+// Replaces the HL pain wedges: a ring of arrows around the crosshair, each
+// pointing at a recent attacker in world space. Latched at hit time, so it
+// behaves like the wedges: turning afterwards doesn't drag the arrows around.
+
+simulated function NoteArrow(vector From, vector PlayerLoc)
+{
+	local int   i, Oldest;
+	local float BestAge;
+
+	// Refresh in place if this direction is already on the ring.
+	for (i = 0; i < ARROWS_MAX; i++)
+	{
+		if (Arrows[i].Time > 0.0
+			&& Normal(Arrows[i].Dir) dot Normal(From - PlayerLoc) > 0.995)
+		{
+			Arrows[i].Time = Level.TimeSeconds;
+			return;
+		}
+	}
+
+	Oldest = 0;
+	for (i = 0; i < ARROWS_MAX; i++)
+	{
+		if (Arrows[i].Time <= 0.0)
+		{
+			Oldest = i;
+			break;
+		}
+		if (Level.TimeSeconds - Arrows[i].Time > BestAge)
+		{
+			BestAge = Level.TimeSeconds - Arrows[i].Time;
+			Oldest  = i;
+		}
+	}
+
+	Arrows[Oldest].Dir  = Normal(From - PlayerLoc);
+	Arrows[Oldest].Time = Level.TimeSeconds;
+}
+
+simulated final function DrawArrowRing(canvas Canvas)
+{
+	local int    i, s;
+	local float  CX, CY, Age, Alpha, Angle, Rad, Step, Scale, Thick, DirX, DirY;
+	local vector ScreenDir;
+
+	CX    = Canvas.ClipX * 0.5;
+	CY    = Canvas.ClipY * 0.5;
+	Scale = FMax(Canvas.ClipY / 600.0, 0.5);
+
+	for (i = 0; i < ARROWS_MAX; i++)
+	{
+		if (Arrows[i].Time <= 0.0)
+			continue;
+
+		Age = Level.TimeSeconds - Arrows[i].Time;
+		if (Age > ARROW_TIME)
+		{
+			Arrows[i].Time = 0.0;
+			continue;
+		}
+
+		Alpha = 1.0 - Age / ARROW_TIME;
+
+		// Project the world-space attacker direction into screen space:
+		// flatten Z (the ring reads direction, not elevation) and rotate into
+		// view space, where the yaw maps straight onto a screen angle.
+		ScreenDir = Arrows[i].Dir >> PlayerOwner.Rotation;
+		Angle     = rotator(ScreenDir).Yaw * (3.14159265 / 32768.0);
+		DirX      = Sin(Angle);
+		DirY      = -Cos(Angle);
+		Rad       = ARROW_RING_R * Scale;
+
+		// The arrow: a stepped line pointing outward from the ring, with a
+		// wider head at the tip. Axis-aligned rect stairs, as everywhere else.
+		for (s = 0; s < ARROW_STEPS; s++)
+		{
+			Step = float(s) / float(ARROW_STEPS - 1);
+			// head: last three steps widen
+			if (s >= ARROW_STEPS - 3)
+				Thick = (3.6 + (s - ARROW_STEPS + 3) * 1.2) * Scale;
+			else
+				Thick = 2.4 * Scale;
+
+			Canvas.SetDrawColor(ArrowColor.R, ArrowColor.G, ArrowColor.B,
+				int(255.0 * Alpha * (1.0 - 0.5 * Step)));
+			Canvas.SetPos(CX + DirX * (Rad + Step * 10.0 * Scale) - Thick * 0.5,
+			              CY + DirY * (Rad + Step * 10.0 * Scale) - Thick * 0.5);
+			Canvas.DrawRect(Texture'Engine.WhiteSquareTexture', Thick, Thick);
+		}
+	}
+}
+
+// --- enemy HP bars -------------------------------------------------------------
+
+simulated final function DrawEnemyHPBar(canvas Canvas)
+{
+	local int    i;
+	local float  Age, Fade, W, Scale, Frac, ShieldFrac;
+	local vector Head, Screen;
+
+	Scale = FMax(Canvas.ClipY / 600.0, 0.5);
+	W     = HPBAR_W * Scale;
+
+	for (i = 0; i < HPBAR_MAX; i++)
+	{
+		if (HPTracks[i].Victim == None)
+			continue;
+
+		Age = Level.TimeSeconds - HPTracks[i].Time;
+		if (Age > HPBAR_TIME || HPTracks[i].Victim.Health <= 0
+			|| HPTracks[i].Victim.bDeleteMe)
+		{
+			HPTracks[i].Victim = None;
+			continue;
+		}
+
+		Head = HPTracks[i].Victim.Location;
+		Head.Z += HPTracks[i].Victim.CollisionHeight + 12;
+
+		Screen = Canvas.WorldToScreen(Head);
+		if (Screen.Z <= 0.0)
+			continue;
+
+		Fade  = 1.0 - Age / HPBAR_TIME;
+		Frac  = float(Clamp(HPTracks[i].Victim.Health, 0, 100)) / 100.0;
+		ShieldFrac = float(Clamp(HPTracks[i].Victim.ShieldStrength, 0, 100)) / 100.0;
+
+		// backing
+		Canvas.SetDrawColor(0, 0, 0, int(160 * Fade));
+		Canvas.SetPos(Screen.X - W * 0.5 - 1, Screen.Y - 1);
+		Canvas.DrawRect(Texture'Engine.WhiteSquareTexture', W + 2, HPBAR_H * Scale + 2);
+
+		// health fill, red as it drops
+		if (Frac > 0.5)
+			Canvas.SetDrawColor(HPBarColor.R, HPBarColor.G, HPBarColor.B, int(220 * Fade));
+		else
+			Canvas.SetDrawColor(255, 40, 40, int(220 * Fade));
+		Canvas.SetPos(Screen.X - W * 0.5, Screen.Y);
+		Canvas.DrawRect(Texture'Engine.WhiteSquareTexture', W * Frac, HPBAR_H * Scale);
+
+		// shield strip above
+		if (ShieldFrac > 0.0)
+		{
+			Canvas.SetDrawColor(ShieldBarColor.R, ShieldBarColor.G, ShieldBarColor.B, int(220 * Fade));
+			Canvas.SetPos(Screen.X - W * 0.5, Screen.Y - HPBAR_H * Scale - 3);
+			Canvas.DrawRect(Texture'Engine.WhiteSquareTexture', W * ShieldFrac, 2.5 * Scale);
+		}
+	}
+}
+
+// --- revenge marker --------------------------------------------------------------
+// A chevron over the head of the player who last killed us, until we get them
+// back or die again.
+
+simulated final function DrawRevengeMarker(canvas Canvas, GoldSrcPlayer GP)
+{
+	local vector Head, Screen;
+	local float  Alpha;
+	local int    CX;
+
+	if (GP.RevengeTarget == None || GP.RevengeTarget.bDeleteMe
+		|| GP.RevengeTarget.Health <= 0)
+		return;
+
+	Head = GP.RevengeTarget.Location;
+	Head.Z += GP.RevengeTarget.CollisionHeight + 30;
+
+	Screen = Canvas.WorldToScreen(Head);
+	if (Screen.Z <= 0.0)
+		return;
+
+	// Pulse so it reads as a marker and not a floating decoration.
+	Alpha = 0.75 + 0.25 * Sin(Level.TimeSeconds * 6.0);
+
+	Canvas.SetDrawColor(255, 60, 30, int(255 * Alpha));
+	// chevron: two stepped diagonals meeting at the top
+	for (CX = 0; CX < 5; CX++)
+	{
+		Canvas.SetPos(Screen.X - 7 + CX, Screen.Y + CX);
+		Canvas.DrawRect(Texture'Engine.WhiteSquareTexture', 3, 3);
+		Canvas.SetPos(Screen.X + 5 - CX, Screen.Y + CX);
+		Canvas.DrawRect(Texture'Engine.WhiteSquareTexture', 3, 3);
+	}
+}
+
+// --- multikill pips --------------------------------------------------------------
+// Pips under the crosshair while a multikill chain is live. Feeds off
+// UnrealPlayer.MultiKillLevel, which the game keeps for the announcer.
+
+simulated final function DrawMultikillPips(canvas Canvas, GoldSrcPlayer GP)
+{
+	local int   i, N, CX, CY;
+	local float Scale;
+
+	N     = GP.MultiKillLevel;
+	Scale = FMax(Canvas.ClipY / 600.0, 0.5);
+	if (N <= 0)
+		return;
+
+	CX = Canvas.ClipX * 0.5;
+	CY = Canvas.ClipY * 0.5 + 40 * Scale;
+
+	for (i = 0; i < N && i < 6; i++)
+	{
+		Canvas.SetDrawColor(255, 200, 60, 230);
+		Canvas.SetPos(CX - (N * 9 * Scale) * 0.5 + i * 9 * Scale, CY);
+		Canvas.DrawRect(Texture'Engine.WhiteSquareTexture', 6 * Scale, 6 * Scale);
+	}
+}
+
+// --- low-HP desaturation ---------------------------------------------------------
+// A cool gray tint plus darkened screen edges. There is no shader access from
+// canvas, so "desaturation" is a translucent blue-gray wash whose opacity
+// scales with how close to dead we are -- it reads as the same thing in motion.
+
+simulated final function DrawDesat(canvas Canvas)
+{
+	local float Frac, Alpha;
+	local Pawn  P;
+
+	if (!bDesaturate || PlayerOwner == None)
+		return;
+
+	P = PlayerOwner.Pawn;
+	if (P == None || P.Health > VIGNETTE_HP)
+		return;
+
+	Frac  = 1.0 - float(P.Health) / float(VIGNETTE_HP);
+	Alpha = int(120 * Frac);
+
+	// full-screen wash
+	Canvas.SetDrawColor(90, 100, 120, Alpha);
+	Canvas.SetPos(0, 0);
+	Canvas.DrawRect(Texture'Engine.WhiteSquareTexture', Canvas.ClipX, Canvas.ClipY);
+
+	// pulsing edge darkening: four border strips, thicker = closer to death
+	Alpha = int(90 * Frac * (0.7 + 0.3 * Sin(Level.TimeSeconds * 5.0)));
+	Canvas.SetDrawColor(0, 0, 0, Alpha);
+	Canvas.SetPos(0, 0);
+	Canvas.DrawRect(Texture'Engine.WhiteSquareTexture', Canvas.ClipX, 30);
+	Canvas.SetPos(0, Canvas.ClipY - 30);
+	Canvas.DrawRect(Texture'Engine.WhiteSquareTexture', Canvas.ClipX, 30);
+	Canvas.SetPos(0, 0);
+	Canvas.DrawRect(Texture'Engine.WhiteSquareTexture', 30, Canvas.ClipY);
+	Canvas.SetPos(Canvas.ClipX - 30, 0);
+	Canvas.DrawRect(Texture'Engine.WhiteSquareTexture', 30, Canvas.ClipY);
+}
+
+// --- weapon pickup respawn timers --------------------------------------------------
+// Countdown text at pickup spots that are currently hidden. Polled, because
+// there is no event for "pickup went hidden".
+
+simulated final function DrawPickupTimers(canvas Canvas)
+{
+	local int    i, Slot;
+	local float  Left, XL, YL;
+	local vector Screen;
+	local string S;
+	local Pickup P;
+
+	if (Level.NetMode != NM_Standalone)
+		return;   // server-authoritative respawn times differ
+
+	if (Level.TimeSeconds < NextPickupScan)
+	{
+		// fall through to draw, list is fresh
+	}
+	else
+	{
+		NextPickupScan = Level.TimeSeconds + PICKUP_SCAN;
+		foreach DynamicActors(class'Pickup', P)
+		{
+			if (WeaponPickup(P) == None)
+				continue;
+
+			// find or create its slot
+			for (Slot = 0; Slot < PICKUP_MAX; Slot++)
+			{
+				if (PickupList[Slot].Pickup == P)
+					break;
+				if (PickupList[Slot].Pickup == None)
+				{
+					PickupList[Slot].Pickup = P;
+					PickupList[Slot].Label  = TrimWeaponName(P.InventoryType);
+					PickupList[Slot].Respawn = P.GetRespawnTime();
+					break;
+				}
+			}
+			if (Slot >= PICKUP_MAX)
+				continue;
+
+			if (!P.bHidden && PickupList[Slot].HiddenSince > 0.0)
+				PickupList[Slot].HiddenSince = 0.0;        // came back
+			else if (P.bHidden && PickupList[Slot].HiddenSince <= 0.0)
+				PickupList[Slot].HiddenSince = Level.TimeSeconds;
+		}
+	}
+
+	for (i = 0; i < PICKUP_MAX; i++)
+	{
+		if (PickupList[i].Pickup == None || PickupList[i].HiddenSince <= 0.0)
+			continue;
+
+		Left = PickupList[i].Respawn - (Level.TimeSeconds - PickupList[i].HiddenSince);
+		if (Left <= 0.0)
+		{
+			PickupList[i].HiddenSince = 0.0;
+			continue;
+		}
+
+		Screen = Canvas.WorldToScreen(PickupList[i].Pickup.Location);
+		if (Screen.Z <= 0.0)
+			continue;
+
+		S = PickupList[i].Label $ "  " $ string(int(Left + 0.999));
+		Canvas.Font = Canvas.SmallFont;
+		Canvas.TextSize(S, XL, YL);
+		Canvas.SetDrawColor(255, 220, 120, 220);
+		Canvas.SetPos(Screen.X - XL * 0.5, Screen.Y - YL);
+		Canvas.DrawText(S);
+	}
+}
+
+simulated final function string TrimWeaponName(class<Inventory> InvType)
+{
+	local string S;
+
+	if (InvType == None)
+		return "?";
+
+	S = string(InvType.Name);
+	if (Len(S) > 10 && InStr(S, "Ammo") < 0)
+		S = Left(S, 10);
+	return S;
+}
+
+// --- rocket-jump / boost stats popup ----------------------------------------------
+
+simulated function NoteRJ(float HeightGain, float Speed)
+{
+	RJHeight = HeightGain;
+	RJSpeed  = Speed;
+	RJTime   = Level.TimeSeconds;
+}
+
+simulated final function DrawRJPopup(canvas Canvas, GoldSrcPlayer GP)
+{
+	local float Age, Alpha, XL, YL;
+	local string S;
+
+	if (!GP.bRJStats || RJTime <= 0.0)
+		return;
+
+	Age = Level.TimeSeconds - RJTime;
+	if (Age > 1.6)
+		return;
+
+	Alpha = 1.0 - Age / 1.6;
+	S = "boost: +" $ string(int(RJHeight)) $ " up  " $ string(int(RJSpeed)) $ " ups";
+	Canvas.Font = Canvas.SmallFont;
+	Canvas.TextSize(S, XL, YL);
+	Canvas.SetDrawColor(255, 210, 120, int(255 * Alpha));
+	Canvas.SetPos(Canvas.ClipX * 0.5 - XL * 0.5, Canvas.ClipY * 0.5 + 70 * FMax(Canvas.ClipY / 600.0, 0.5));
+	Canvas.DrawText(S);
+}
+
+// --- killcam label ------------------------------------------------------------------
+
+simulated final function DrawKillcamLabel(canvas Canvas, GoldSrcPlayer GP)
+{
+	local float Alpha, XL, YL;
+	local string S;
+
+	if (!GP.bKillcamActive || GP.KillcamEnd <= 0.0 || Level.TimeSeconds > GP.KillcamEnd)
+		return;
+
+	Alpha = FMin(1.0, GP.KillcamEnd - Level.TimeSeconds);
+	S = "KILLCAM: " $ GP.KillcamName;
+	Canvas.Font = Canvas.MedFont;
+	Canvas.TextSize(S, XL, YL);
+	Canvas.SetDrawColor(255, 255, 255, int(220 * Alpha));
+	Canvas.SetPos(Canvas.ClipX * 0.5 - XL * 0.5, Canvas.ClipY * 0.12);
+	Canvas.DrawText(S);
+}
+
+// --- death recap ---------------------------------------------------------------------
+// Killer, weapon, distance, their remaining HP, plus the per-life damage-taken
+// breakdown the player controller has been accumulating.
+
+simulated final function DrawDeathRecap(canvas Canvas, GoldSrcPlayer GP)
+{
+	local float Age, Alpha, Y, XL, YL, X;
+	local int    i;
+	local string S;
+
+	if (!bDeathRecap || GP.RecapShowUntil <= 0.0 || Level.TimeSeconds > GP.RecapShowUntil)
+		return;
+
+	Age   = GP.RecapShowUntil - Level.TimeSeconds;
+	Alpha = FMin(1.0, Age * 2.0);   // fade only at the very end
+
+	X = Canvas.ClipX * 0.5;
+	Y = Canvas.ClipY * 0.3;
+
+	// panel backing
+	Canvas.SetDrawColor(0, 0, 0, int(150 * Alpha));
+	Canvas.SetPos(X - 200, Y - 24);
+	Canvas.DrawRect(Texture'Engine.WhiteSquareTexture', 400, 150 + GP.RecapRows * 16);
+
+	Canvas.Font = Canvas.MedFont;
+	S = "KILLED BY  " $ GP.RecapKiller;
+	Canvas.TextSize(S, XL, YL);
+	Canvas.SetDrawColor(255, 60, 60, int(255 * Alpha));
+	Canvas.SetPos(X - XL * 0.5, Y);
+	Canvas.DrawText(S);
+
+	Y += YL + 8;
+	Canvas.Font = Canvas.SmallFont;
+	S = GP.RecapWeapon $ "   at " $ string(int(GP.RecapDist)) $ " units   (" $ string(GP.RecapKillerHP) $ " HP left)";
+	Canvas.TextSize(S, XL, YL);
+	Canvas.SetDrawColor(220, 220, 220, int(255 * Alpha));
+	Canvas.SetPos(X - XL * 0.5, Y);
+	Canvas.DrawText(S);
+
+	Y += YL + 12;
+	S = "damage taken this life:";
+	Canvas.TextSize(S, XL, YL);
+	Canvas.SetDrawColor(160, 160, 160, int(255 * Alpha));
+	Canvas.SetPos(X - XL * 0.5, Y);
+	Canvas.DrawText(S);
+
+	Y += YL + 2;
+	for (i = 0; i < GP.RecapRows; i++)
+	{
+		S = GP.GetRecapRow(i);
+		if (S == "")
+			continue;
+		Canvas.TextSize(S, XL, YL);
+		Canvas.SetDrawColor(190, 190, 190, int(255 * Alpha));
+		Canvas.SetPos(X - XL * 0.5, Y);
+		Canvas.DrawText(S);
+		Y += YL + 2;
+	}
+}
+
+// --- spectator HUD ---------------------------------------------------------------------
+
+simulated final function DrawSpectatorHUD(canvas Canvas)
+{
+	local float XL, YL;
+	local string S;
+
+	if (PlayerOwner == None || !bSpectatorHUD)
+		return;
+
+	if (PlayerOwner.PlayerReplicationInfo == None)
+		return;
+	if (!PlayerOwner.PlayerReplicationInfo.bOnlySpectator
+		&& !(PlayerOwner.Pawn == None && PlayerOwner.ViewTarget != None
+		     && Pawn(PlayerOwner.ViewTarget) != None && Pawn(PlayerOwner.ViewTarget).Controller != PlayerOwner))
+		return;
+
+	if (PlayerOwner.ViewTarget != None && PlayerOwner.ViewTarget != PlayerOwner.Pawn)
+	{
+		S = "SPECTATING  " $ SpectateeName();
+		Canvas.Font = Canvas.MedFont;
+		Canvas.TextSize(S, XL, YL);
+		Canvas.SetDrawColor(255, 255, 255, 230);
+		Canvas.SetPos(Canvas.ClipX * 0.5 - XL * 0.5, Canvas.ClipY * 0.08);
+		Canvas.DrawText(S);
+	}
+	else
+	{
+		S = "SPECTATOR";
+		Canvas.Font = Canvas.MedFont;
+		Canvas.TextSize(S, XL, YL);
+		Canvas.SetDrawColor(255, 255, 255, 230);
+		Canvas.SetPos(Canvas.ClipX * 0.5 - XL * 0.5, Canvas.ClipY * 0.08);
+		Canvas.DrawText(S);
+	}
+}
+
+simulated final function string SpectateeName()
+{
+	local Pawn P;
+
+	P = Pawn(PlayerOwner.ViewTarget);
+	if (P == None)
+		return "...";
+	if (P.PlayerReplicationInfo != None)
+		return P.PlayerReplicationInfo.PlayerName;
+	return string(P.Name);
+}
+
+// --- stats panel (Tab) / modern scoreboard / MVP card ------------------------------------
+// All three share the stats the player controller keeps on its PRI side. The
+// panel replaces the stock scoreboard while it is up: DrawHudPassA checks
+// bScoreboardDrawn (set here) and skips the stock board.
+
+simulated final function DrawScorePanel(canvas Canvas)
+{
+	local GoldSrcPlayer GP;
+	local float XL, YL, Y, X0, RowH;
+	local string S;
+
+	GP = GoldSrcPlayer(PlayerOwner);
+	if (GP == None)
+		return;
+
+	if (!bModernScoreboard || !bShowScoreBoard)
+		return;
+
+	X0   = Canvas.ClipX * 0.5 - 260;
+	Y    = Canvas.ClipY * 0.15;
+	RowH = 20;
+
+	// backing
+	Canvas.SetDrawColor(0, 0, 0, 160);
+	Canvas.SetPos(X0 - 16, Y - 30);
+	Canvas.DrawRect(Texture'Engine.WhiteSquareTexture', 552, 420);
+
+	Canvas.Font = Canvas.MedFont;
+	S = "GOLDSRC DEATHMATCH";
+	Canvas.TextSize(S, XL, YL);
+	Canvas.SetDrawColor(255, 210, 120, 255);
+	Canvas.SetPos(Canvas.ClipX * 0.5 - XL * 0.5, Y - 26);
+	Canvas.DrawText(S);
+
+	Y += 10;
+
+	// personal stats block
+	Canvas.Font = Canvas.SmallFont;
+	S = "YOUR SESSION";
+	Canvas.TextSize(S, XL, YL);
+	Canvas.SetDrawColor(160, 200, 255, 255);
+	Canvas.SetPos(X0, Y);
+	Canvas.DrawText(S);
+	Y += YL + 4;
+
+	S = "kills " $ GP.StatKills $ "   deaths " $ GP.StatDeaths
+		$ "   K/D " $ Fmt2(float(GP.StatKills) / FMax(1.0, float(GP.StatDeaths)));
+	Canvas.SetDrawColor(230, 230, 230, 255);
+	Canvas.SetPos(X0, Y);
+	Canvas.DrawText(S);
+	Y += YL + 2;
+
+	S = "damage dealt " $ GP.StatDamageDealt $ "   taken " $ GP.StatDamageTaken;
+	Canvas.SetDrawColor(230, 230, 230, 255);
+	Canvas.SetPos(X0, Y);
+	Canvas.DrawText(S);
+	Y += YL + 2;
+
+	S = "best streak " $ GP.StatBestStreak $ "   accuracy " $ Fmt2(GP.GetAccuracy()) $ "%";
+	Canvas.SetDrawColor(230, 230, 230, 255);
+	Canvas.SetPos(X0, Y);
+	Canvas.DrawText(S);
+	Y += YL + 14;
+
+	// scoreboard table
+	Canvas.Font = Canvas.SmallFont;
+	S = "PLAYER                        KILLS   DEATHS   PING";
+	Canvas.SetDrawColor(160, 160, 160, 255);
+	Canvas.SetPos(X0, Y);
+	Canvas.DrawText(S);
+	Y += YL + 6;
+
+	DrawPlayerRows(Canvas, X0, Y, RowH);
+}
+
+// The table rows shared by the panel and the MVP card's ranking list.
+
+simulated final function DrawPlayerRows(canvas Canvas, float X0, float Y, float RowH)
+{
+	local GameReplicationInfo GRI;
+	local PlayerReplicationInfo PRI, Sorted[16];
+	local int    i, j, N;
+	local string S;
+	local color  C;
+
+	GRI = PlayerOwner.GameReplicationInfo;
+	if (GRI == None)
+		return;
+
+	// insertion sort by kills, capped at 16 rows
+	N = 0;
+	for (i = 0; i < GRI.PRIArray.Length && N < 16; i++)
+	{
+		PRI = GRI.PRIArray[i];
+		if (PRI == None || PRI.bOnlySpectator)
+			continue;
+		for (j = N; j > 0 && Sorted[j - 1].Kills < PRI.Kills; j--)
+			Sorted[j] = Sorted[j - 1];
+		Sorted[j] = PRI;
+		N++;
+	}
+
+	for (i = 0; i < N; i++)
+	{
+		PRI = Sorted[i];
+		S = PRI.PlayerName;
+		while (Len(S) < 26)
+			S = S $ " ";
+		S = S $ string(PRI.Kills);
+		while (Len(S) < 34)
+			S = S $ " ";
+		S = S $ string(int(PRI.Deaths));
+		while (Len(S) < 44)
+			S = S $ " ";
+		S = S $ string(Max(0, PRI.Ping));
+
+		if (PRI == PlayerOwner.PlayerReplicationInfo)
+		{
+			C.R = 255; C.G = 220; C.B = 120; C.A = 255;
+		}
+		else
+		{
+			C.R = 220; C.G = 220; C.B = 220; C.A = 255;
+		}
+
+		Canvas.SetDrawColor(C.R, C.G, C.B, 255);
+		Canvas.SetPos(X0, Y + i * RowH);
+		Canvas.DrawText(S);
+	}
+}
+
+// --- MVP card: end-of-match -----------------------------------------------------------
+
+simulated final function DrawMVPCard(canvas Canvas)
+{
+	local GoldSrcPlayer GP;
+	local GameReplicationInfo GRI;
+	local PlayerReplicationInfo PRI, MVP;
+	local int    i;
+	local float  XL, YL, Y, X;
+	local string S;
+
+	if (!bMVPCard || Level.Game == None || !Level.Game.bGameEnded)
+		return;
+
+	GP  = GoldSrcPlayer(PlayerOwner);
+	GRI = PlayerOwner.GameReplicationInfo;
+	if (GRI == None)
+		return;
+
+	// MVP = most kills
+	for (i = 0; i < GRI.PRIArray.Length; i++)
+	{
+		PRI = GRI.PRIArray[i];
+		if (PRI == None || PRI.bOnlySpectator)
+			continue;
+		if (MVP == None || PRI.Kills > MVP.Kills)
+			MVP = PRI;
+	}
+	if (MVP == None)
+		return;
+
+	X = Canvas.ClipX * 0.5;
+	Y = Canvas.ClipY * 0.22;
+
+	Canvas.SetDrawColor(0, 0, 0, 170);
+	Canvas.SetPos(X - 230, Y - 30);
+	Canvas.DrawRect(Texture'Engine.WhiteSquareTexture', 460, 240);
+
+	Canvas.Font = Canvas.MedFont;
+	S = "MATCH OVER";
+	Canvas.TextSize(S, XL, YL);
+	Canvas.SetDrawColor(255, 210, 120, 255);
+	Canvas.SetPos(X - XL * 0.5, Y - 24);
+	Canvas.DrawText(S);
+	Y += 16;
+
+	Canvas.Font = Canvas.MedFont;
+	S = "MVP:  " $ MVP.PlayerName $ "  (" $ string(MVP.Kills) $ " kills)";
+	Canvas.TextSize(S, XL, YL);
+	Canvas.SetDrawColor(255, 255, 255, 255);
+	Canvas.SetPos(X - XL * 0.5, Y);
+	Canvas.DrawText(S);
+	Y += YL + 16;
+
+	if (GP != None)
+	{
+		Canvas.Font = Canvas.SmallFont;
+		S = "your match:  " $ GP.StatKills $ " kills  " $ GP.StatDeaths $ " deaths  "
+			$ GP.StatDamageDealt $ " dmg dealt  " $ GP.StatDamageTaken $ " dmg taken";
+		Canvas.TextSize(S, XL, YL);
+		Canvas.SetDrawColor(230, 230, 230, 255);
+		Canvas.SetPos(X - XL * 0.5, Y);
+		Canvas.DrawText(S);
+		Y += YL + 14;
+
+		S = "best streak " $ GP.StatBestStreak $ "   accuracy " $ Fmt2(GP.GetAccuracy()) $ "%";
+		Canvas.TextSize(S, XL, YL);
+		Canvas.SetDrawColor(230, 230, 230, 255);
+		Canvas.SetPos(X - XL * 0.5, Y);
+		Canvas.DrawText(S);
+		Y += YL + 12;
+	}
+
+	Canvas.Font = Canvas.SmallFont;
+	S = "PLAYER                        KILLS   DEATHS   PING";
+	Canvas.SetDrawColor(160, 160, 160, 255);
+	Canvas.SetPos(X - 216, Y);
+	Canvas.DrawText(S);
+	Y += 18;
+
+	DrawPlayerRows(Canvas, X - 216, Y, 16);
+}
+
 // The two the GoldSrcPlayer execs ask for by name. The HL row rides on the overlay
 // pass, so there is no stock layout to save here -- these exist so cl_goldsrchud
 // has somewhere to land and stay symmetric with the P2 version.
@@ -1982,6 +2938,24 @@ defaultproperties
 	KillColor=(R=255,G=32,B=32,A=255)   // killing blow, red
 	bHitmarker=true
 	bDamageNumbers=true
+	bKillfeed=true
+	bArrowRing=true
+	bEnemyHPBar=true
+	bRevengeMarker=true
+	bMultikillPips=true
+	bDeathRecap=true
+	bPickupTimers=true
+	bDesaturate=true
+	bModernScoreboard=true
+	bMVPCard=true
+	bSpectatorHUD=true
+	FeedColor=(R=180,G=180,B=180,A=255)
+	MyFeedColor=(R=255,G=220,B=120,A=255)
+	FeedSelfColor=(R=255,G=90,B=90,A=255)
+	ArrowColor=(R=255,G=80,B=60,A=255)
+	HPBarColor=(R=90,G=220,B=90,A=255)
+	ShieldBarColor=(R=110,G=190,B=255,A=255)
+	VignetteColor=(R=90,G=100,B=120,A=255)
 	HudMinAlpha=200.0
 	HudScale=0.85
 	HudFontSize=1

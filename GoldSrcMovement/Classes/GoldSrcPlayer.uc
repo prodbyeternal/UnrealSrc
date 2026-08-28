@@ -13,6 +13,34 @@ var float  FloorBaseSeen;          // last time ground contact was confirmed
 var JumpPad LastJumpPad;            // re-trigger guard: one boost per pad contact
 var float   LastJumpPadTime;
 
+
+// Everything the HUD draws but the controller has to own: kill/killcam/recap
+// latches, session stats, per-life damage breakdown, revenge target, RJ stats.
+
+var Pawn  RevengeTarget;       // last player who killed us, marker until answered
+var float KillcamEnd;          // killcam active until this TimeSeconds
+var name  KillcamState;        // state to return to when the killcam ends
+var string KillcamName;        // whose POV we are on
+
+var float RecapShowUntil;      // death recap panel visible until
+var string RecapKiller;
+var string RecapWeapon;
+var float  RecapDist;
+var int    RecapKillerHP;
+var int    RecapRows;          // how many breakdown rows are live
+
+// per-life damage taken, by damage type name -> total
+var name  RecapTypes[8];
+var int   RecapDamage[8];
+
+// session stats (shown on Tab panel / MVP card)
+var int StatKills, StatDeaths, StatDamageDealt, StatDamageTaken;
+var int StatShotsFired, StatShotsHit;   // accuracy (instant-hit only is fine)
+var int StatStreak, StatBestStreak;
+var config bool bRJStats;      // cl_rjstats -- rocket-jump/boost stat popup
+var config bool bKillcam;      // cl_killcam -- 2s from the killer's eyes on death
+var bool  bKillcamActive;
+
 var config bool bGoldSrcMovement;   // Master enable
 var config bool bShowSpeedometer;
 var config bool bShowMoveDebug;
@@ -194,6 +222,15 @@ var int   FootStepSide;     // alternate -1/+1 so we get left/right steps
 
 // Jump is bound as an exec, so this fires even when the aUp axis is being
 // cancelled out by the duck bind. Latch it for the next movement frame.
+// Accuracy denominator: every fire press while alive with a weapon counts.
+exec function Fire(optional float F)
+{
+	if (Pawn != None && Pawn.Weapon != None)
+		StatShotsFired++;
+
+	Super.Fire(F);
+}
+
 exec function Jump(optional float F)
 {
 	bJumpLatched = true;
@@ -265,6 +302,10 @@ function Possess(Pawn aPawn)
 	DuckTapKeyInFlight = 0;
 
 	bMoveInitialized = false;
+
+	// fresh life: clear the per-life recap rows and the killcam
+	RecapRows = 0;
+	EndKillcam();
 
 	if (bGoldSrcMovement)
 		GotoState('PlayerGoldSrcWalking');
@@ -1152,9 +1193,20 @@ final function RestoreStockEyeHeight(optional bool bCrouched)
 // Damage reaches the simulation through here and nowhere else.
 function NotifyTakeHit(pawn InstigatedBy, vector HitLocation, int Damage, class<DamageType> damageType, vector Momentum)
 {
+	NoteDamageTaken(Damage, damageType);
+
 	DriveDamage(Damage, damageType, Momentum, InstigatedBy);
 
 	NotifyDamageDirection(InstigatedBy, HitLocation, Momentum);
+
+	// Modern arrow ring: same direction data the HL wedges read.
+	if (bDamageIndicator && GoldSrcHUD(myHUD) != None)
+	{
+		if (InstigatedBy != None)
+			GoldSrcHUD(myHUD).NoteArrow(InstigatedBy.Location, Pawn.Location);
+		else if (VSize(Momentum) > 0.0)
+			GoldSrcHUD(myHUD).NoteArrow(Pawn.Location - Normal(Momentum) * DAMAGE_DIR_REACH, Pawn.Location);
+	}
 
 	Super.NotifyTakeHit(InstigatedBy, HitLocation, Damage, DamageType, Momentum);
 }
@@ -1165,16 +1217,173 @@ function NotifyTakeHit(pawn InstigatedBy, vector HitLocation, int Damage, class<
 // damage event in the game, forwards the ones we instigated to here. That one
 // point covers projectiles, instant fire and the shield gun alike, without
 // subclassing a single weapon. Feeds the hitmarker and the damage counters.
-function NotifyEnemyHit(Pawn Victim, vector HitLocation, int Damage, bool bKilled)
+function NotifyEnemyHit(Pawn Victim, vector HitLocation, int Damage,
+	int ShieldDamage, bool bKilled)
+{
+	local GoldSrcHUD H;
+
+	if (Victim == None)
+		return;
+
+	StatDamageDealt += Damage;
+	StatShotsHit++;
+
+	H = GoldSrcHUD(myHUD);
+	if (H != None)
+		H.NoteEnemyHit(Victim, HitLocation, Damage, ShieldDamage, bKilled);
+}
+
+
+// Called by GoldSrcGameInfo when ANY pawn dies; each GoldSrcPlayer feeds its
+// own HUD's killfeed, and the killer/victim bookkeeping lands here too.
+function NoteKill(Controller Killer, Controller Victim, class<DamageType> DamageType)
+{
+	local GoldSrcHUD H;
+	local class<WeaponDamageType> WDT;
+	local string KillerName, VictimName, WeaponName;
+	local bool   bSuicide;
+
+	if (Victim == None)
+		return;
+
+	VictimName = "someone";
+	if (Victim.PlayerReplicationInfo != None)
+		VictimName = Victim.PlayerReplicationInfo.PlayerName;
+
+	WeaponName = "died";
+	WDT = class<WeaponDamageType>(DamageType);
+	if (WDT != None && WDT.default.WeaponClass != None)
+		WeaponName = string(WDT.default.WeaponClass.Name);
+	else if (ClassIsChildOf(DamageType, class'Fell'))
+		WeaponName = "fell";
+
+	KillerName = "";
+	if (Killer != None && Killer.PlayerReplicationInfo != None)
+		KillerName = Killer.PlayerReplicationInfo.PlayerName;
+
+	bSuicide = (Killer == None || Killer == Victim);
+
+	// Victim bookkeeping: death stats, revenge latch, death recap, killcam.
+	if (Victim == Self)
+	{
+		StatDeaths++;
+		StatStreak = 0;
+
+		RecapKiller = "the world";
+		if (KillerName != "")
+			RecapKiller = KillerName;
+
+		RecapWeapon  = WeaponName;
+		RecapKillerHP = 0;
+		RecapDist    = 0.0;
+
+		if (Killer != None && Killer != Self && Killer.Pawn != None)
+		{
+			RevengeTarget = Killer.Pawn;
+			RecapKillerHP = Killer.Pawn.Health;
+			if (Pawn != None)
+				RecapDist = VSize(Killer.Pawn.Location - Pawn.Location);
+			StartKillcam(Killer);
+		}
+		else
+			RevengeTarget = None;
+
+		RecapShowUntil = Level.TimeSeconds + 4.0;
+	}
+	// Killer bookkeeping (ours only).
+	else if (Killer == Self)
+	{
+		StatKills++;
+		StatStreak++;
+		StatBestStreak = Max(StatBestStreak, StatStreak);
+		if (RevengeTarget != None && Victim.Pawn == RevengeTarget)
+			RevengeTarget = None;   // revenge served
+	}
+
+	// Killfeed for our own HUD.
+	H = GoldSrcHUD(myHUD);
+	if (H != None)
+		H.NoteKill(KillerName, VictimName, WeaponName, bSuicide,
+			(Killer == Self || Victim == Self));
+}
+
+// Per-life damage-taken breakdown, fed from NotifyTakeHit. Sums by damage
+// type name, capped at 8 rows.
+function NoteDamageTaken(int Damage, class<DamageType> DamageType)
+{
+	local int i;
+
+	if (Damage <= 0 || DamageType == None)
+		return;
+
+	StatDamageTaken += Damage;
+
+	for (i = 0; i < 8; i++)
+	{
+		if (RecapTypes[i] == DamageType.Name || RecapTypes[i] == '')
+		{
+			RecapTypes[i]   = DamageType.Name;
+			RecapDamage[i] += Damage;
+			if (i + 1 > RecapRows)
+				RecapRows = i + 1;
+			return;
+		}
+	}
+}
+
+function string GetRecapRow(int i)
+{
+	if (i < 0 || i >= 8 || RecapTypes[i] == '')
+		return "";
+	return string(RecapDamage[i]) $ "  " $ string(RecapTypes[i]);
+}
+
+function float GetAccuracy()
+{
+	if (StatShotsFired <= 0)
+		return 0.0;
+	return 100.0 * float(StatShotsHit) / float(StatShotsFired);
+}
+
+// Killcam: park the dead player's view on their killer's pawn for 2 seconds.
+// Called from our Dead-state override of Fire (i.e. any attempt to respawn
+// early skips it), and auto-clears by timer.
+function StartKillcam(Controller Killer)
+{
+	if (Killer == None || Killer.Pawn == None || !bGoldSrcMovement || !bKillcam)
+		return;
+
+	bKillcamActive = true;
+	KillcamEnd     = Level.TimeSeconds + 2.0;
+	KillcamName    = "?";
+	if (Killer.PlayerReplicationInfo != None)
+		KillcamName = Killer.PlayerReplicationInfo.PlayerName;
+
+	SetViewTarget(Killer.Pawn);
+	bBehindView    = false;
+}
+
+function EndKillcam()
+{
+	if (!bKillcamActive)
+		return;
+
+	bKillcamActive = false;
+	KillcamEnd     = 0.0;
+	SetViewTarget(None);
+	bBehindView    = true;
+}
+
+// RJ/boost stats: hooked from DamageKnockback when a self-blast has real lift.
+function NoteRJStats(float ZGain, float Speed)
 {
 	local GoldSrcHUD H;
 
 	H = GoldSrcHUD(myHUD);
-	if (H == None || Victim == None)
-		return;
-
-	H.NoteEnemyHit(HitLocation, Damage, bKilled);
+	if (H != None)
+		H.NoteRJ(ZGain, Speed);
 }
+
 
 // How far back along the momentum to place an attacker we never saw. The
 // indicator only ever uses the DIRECTION of that offset, so the distance just has
@@ -1256,6 +1465,11 @@ final function DriveDamage(int Damage, class<DamageType> damageType, vector Mome
 		Kick = BudgetDamagePush(DamageKnockback(Damage, damageType, Momentum, InstigatedBy));
 
 	Move.velocity += Kick;
+
+	// Rocket-jump / shield-boost stat: latch the launch so the HUD can show
+	// the height this blast is worth (v^2 / 2g) once we are flying.
+	if (InstigatedBy == Pawn && bRJStats && Move.velocity.Z > 250.0)
+		NoteRJStats(Square(Move.velocity.Z) / (2.0 * Move.sv_gravity), VSize(Move.velocity));
 
 	// A blast jump is not a flinch: the cap exists so a bullet cannot outrun
 	// the player, and applying it to our own rocket would cut the jump's whole
@@ -1678,6 +1892,177 @@ exec function cl_dmgnumbers(optional string OnOff)
 
 	H.SaveConfig();
 	ClientMessage("cl_dmgnumbers:" @ OnOffStr(H.bDamageNumbers));
+}
+
+// One exec per feature, same pattern as the ones above. cl_menu opens the
+// GUI config page that wraps all of them.
+
+exec function cl_killfeed(optional string OnOff)
+{
+	local GoldSrcHUD H;
+
+	H = GoldSrcHUD(myHUD);
+	if (H == None) return;
+	if (OnOff == "0")      H.bKillfeed = false;
+	else if (OnOff != "")  H.bKillfeed = true;
+	else                   H.bKillfeed = !H.bKillfeed;
+	H.SaveConfig();
+	ClientMessage("cl_killfeed:" @ OnOffStr(H.bKillfeed));
+}
+
+exec function cl_arrowring(optional string OnOff)
+{
+	local GoldSrcHUD H;
+
+	H = GoldSrcHUD(myHUD);
+	if (H == None) return;
+	if (OnOff == "0")      H.bArrowRing = false;
+	else if (OnOff != "")  H.bArrowRing = true;
+	else                   H.bArrowRing = !H.bArrowRing;
+	H.SaveConfig();
+	ClientMessage("cl_arrowring:" @ OnOffStr(H.bArrowRing));
+}
+
+exec function cl_enemyhpbar(optional string OnOff)
+{
+	local GoldSrcHUD H;
+
+	H = GoldSrcHUD(myHUD);
+	if (H == None) return;
+	if (OnOff == "0")      H.bEnemyHPBar = false;
+	else if (OnOff != "")  H.bEnemyHPBar = true;
+	else                   H.bEnemyHPBar = !H.bEnemyHPBar;
+	H.SaveConfig();
+	ClientMessage("cl_enemyhpbar:" @ OnOffStr(H.bEnemyHPBar));
+}
+
+exec function cl_revengemarker(optional string OnOff)
+{
+	local GoldSrcHUD H;
+
+	H = GoldSrcHUD(myHUD);
+	if (H == None) return;
+	if (OnOff == "0")      H.bRevengeMarker = false;
+	else if (OnOff != "")  H.bRevengeMarker = true;
+	else                   H.bRevengeMarker = !H.bRevengeMarker;
+	H.SaveConfig();
+	ClientMessage("cl_revengemarker:" @ OnOffStr(H.bRevengeMarker));
+}
+
+exec function cl_multikillpips(optional string OnOff)
+{
+	local GoldSrcHUD H;
+
+	H = GoldSrcHUD(myHUD);
+	if (H == None) return;
+	if (OnOff == "0")      H.bMultikillPips = false;
+	else if (OnOff != "")  H.bMultikillPips = true;
+	else                   H.bMultikillPips = !H.bMultikillPips;
+	H.SaveConfig();
+	ClientMessage("cl_multikillpips:" @ OnOffStr(H.bMultikillPips));
+}
+
+exec function cl_deathrecap(optional string OnOff)
+{
+	local GoldSrcHUD H;
+
+	H = GoldSrcHUD(myHUD);
+	if (H == None) return;
+	if (OnOff == "0")      H.bDeathRecap = false;
+	else if (OnOff != "")  H.bDeathRecap = true;
+	else                   H.bDeathRecap = !H.bDeathRecap;
+	H.SaveConfig();
+	ClientMessage("cl_deathrecap:" @ OnOffStr(H.bDeathRecap));
+}
+
+exec function cl_pickuptimers(optional string OnOff)
+{
+	local GoldSrcHUD H;
+
+	H = GoldSrcHUD(myHUD);
+	if (H == None) return;
+	if (OnOff == "0")      H.bPickupTimers = false;
+	else if (OnOff != "")  H.bPickupTimers = true;
+	else                   H.bPickupTimers = !H.bPickupTimers;
+	H.SaveConfig();
+	ClientMessage("cl_pickuptimers:" @ OnOffStr(H.bPickupTimers));
+}
+
+exec function cl_desaturate(optional string OnOff)
+{
+	local GoldSrcHUD H;
+
+	H = GoldSrcHUD(myHUD);
+	if (H == None) return;
+	if (OnOff == "0")      H.bDesaturate = false;
+	else if (OnOff != "")  H.bDesaturate = true;
+	else                   H.bDesaturate = !H.bDesaturate;
+	H.SaveConfig();
+	ClientMessage("cl_desaturate:" @ OnOffStr(H.bDesaturate));
+}
+
+exec function cl_killcam(optional string OnOff)
+{
+	if (OnOff == "0")      bKillcam = false;
+	else if (OnOff != "")  bKillcam = true;
+	else                   bKillcam = !bKillcam;
+	SaveConfig();
+	ClientMessage("cl_killcam:" @ OnOffStr(bKillcam));
+}
+
+exec function cl_scoreboard(optional string OnOff)
+{
+	local GoldSrcHUD H;
+
+	H = GoldSrcHUD(myHUD);
+	if (H == None) return;
+	if (OnOff == "0")      H.bModernScoreboard = false;
+	else if (OnOff != "")  H.bModernScoreboard = true;
+	else                   H.bModernScoreboard = !H.bModernScoreboard;
+	H.SaveConfig();
+	ClientMessage("cl_scoreboard:" @ OnOffStr(H.bModernScoreboard));
+}
+
+exec function cl_mvpcard(optional string OnOff)
+{
+	local GoldSrcHUD H;
+
+	H = GoldSrcHUD(myHUD);
+	if (H == None) return;
+	if (OnOff == "0")      H.bMVPCard = false;
+	else if (OnOff != "")  H.bMVPCard = true;
+	else                   H.bMVPCard = !H.bMVPCard;
+	H.SaveConfig();
+	ClientMessage("cl_mvpcard:" @ OnOffStr(H.bMVPCard));
+}
+
+exec function cl_spectatorhud(optional string OnOff)
+{
+	local GoldSrcHUD H;
+
+	H = GoldSrcHUD(myHUD);
+	if (H == None) return;
+	if (OnOff == "0")      H.bSpectatorHUD = false;
+	else if (OnOff != "")  H.bSpectatorHUD = true;
+	else                   H.bSpectatorHUD = !H.bSpectatorHUD;
+	H.SaveConfig();
+	ClientMessage("cl_spectatorhud:" @ OnOffStr(H.bSpectatorHUD));
+}
+
+exec function cl_rjstats(optional string OnOff)
+{
+	if (OnOff == "0")      bRJStats = false;
+	else if (OnOff != "")  bRJStats = true;
+	else                   bRJStats = !bRJStats;
+	SaveConfig();
+	ClientMessage("cl_rjstats:" @ OnOffStr(bRJStats));
+}
+
+// The GUI page (GoldSrcSettingsPage) wraps all of the above; bind a key to it
+// or type this in the console.
+exec function cl_menu()
+{
+	ClientOpenMenu("GoldSrcMovement.GoldSrcSettingsPage");
 }
 
 // Half-Life's bottom row layout, drawn with plain coloured digits.
@@ -2918,6 +3303,10 @@ function CalcFirstPersonView(out vector CameraLocation, out rotator CameraRotati
 // GoldSrc state whenever we find ourselves parked in one of the movement states.
 function PlayerTick(float DeltaTime)
 {
+	// Killcam expiry: lazy, so no timer is hijacked.
+	if (bKillcamActive && Level.TimeSeconds >= KillcamEnd)
+		EndKillcam();
+
 	// Reclaim PHYS_None BEFORE Super.PlayerTick, which dispatches into native
 	// movement. Pawn.TakeDamage can stomp us to PHYS_Walking mid-damage-call, and
 	// the pawn's native tick can then walk-step and floor-snap against a hull it
@@ -2990,6 +3379,8 @@ defaultproperties
 	ViewRollSpeed=300.0         // Half-Life's own cl_rollspeed
 	bGoldSrcFootSteps=true
 	bDamageIndicator=true
+	bRJStats=true
+	bKillcam=true
 	MoveAxisMax=300.0           // UT2004's shipped movement bind deflection
 	DuckPulseSeconds=0.12
 }
