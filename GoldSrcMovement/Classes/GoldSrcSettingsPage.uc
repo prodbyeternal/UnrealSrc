@@ -1,8 +1,4 @@
-// GoldSrcSettingsPage
-// The config menu for every modern-DM HUD toggle. Opened with the console
-// command "cl_menu" (bindable: setbind X cl_menu). Reads the live values off
-// the HUD on open, writes them back and saves on every change, so it doubles
-// as the discoverability layer for the whole cl_* family.
+
 class GoldSrcSettingsPage extends GUIPage;
 
 #exec OBJ LOAD FILE=GUI2K4A.utx
